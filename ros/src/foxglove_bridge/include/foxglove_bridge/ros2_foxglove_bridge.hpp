@@ -95,7 +95,14 @@ private:
 
   std::unique_ptr<foxglove::WebSocketServer> _server;
   std::unique_ptr<foxglove::SystemInfoPublisher> _sysinfoPublisher;
-  std::unordered_map<ChannelId, foxglove::RawChannel> _channels;
+  // Stored as shared_ptr so rosMessageHandler can copy a handle out under
+  // _subscriptionsMutex and call channel->log() (the expensive, per-client
+  // fan-out memcpy) after releasing the lock, without racing a concurrent
+  // erase from updateAdvertisedTopics on the rosgraph poll thread. RawChannel
+  // itself is move-only (non-refcounted at the C++ level), so a bare copy
+  // isn't available -- the shared_ptr wrapper is the minimal way to keep the
+  // handle alive past the erase.
+  std::unordered_map<ChannelId, std::shared_ptr<foxglove::RawChannel>> _channels;
 
   // One shared ROS subscription per channel, reference-counted by client subscriptions
   struct CachedMessage {

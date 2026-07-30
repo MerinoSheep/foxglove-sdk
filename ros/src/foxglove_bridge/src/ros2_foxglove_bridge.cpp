@@ -535,7 +535,7 @@ void FoxgloveBridge::updateAdvertisedTopics(
 
   // Collect channels to close outside the lock to avoid deadlock:
   // channel.close() can fire onUnsubscribe callbacks that re-acquire _subscriptionsMutex.
-  std::vector<foxglove::RawChannel> channelsToClose;
+  std::vector<std::shared_ptr<foxglove::RawChannel>> channelsToClose;
 
   {
     std::lock_guard<std::mutex> lock(_subscriptionsMutex);
@@ -543,13 +543,13 @@ void FoxgloveBridge::updateAdvertisedTopics(
     // Remove channels for which the topic does not exist anymore
     for (auto channelIt = _channels.begin(); channelIt != _channels.end();) {
       auto& channel = channelIt->second;
-      const auto channelSchema = channel.schema();
+      const auto channelSchema = channel->schema();
       // Channels advertised without a schema (definition lookup failed) have no schema name.
       // Accessing .value() unconditionally would throw bad_optional_access and abort the whole
       // topic update, permanently stopping advertisement of new topics. Match those channels by
       // topic alone.
       std::string schemaName = channelSchema.has_value() ? channelSchema->name : "";
-      std::string topic(channel.topic());
+      std::string topic(channel->topic());
       const TopicAndDatatype topicAndSchemaName = {topic, schemaName};
       const bool topicStillExists =
         channelSchema.has_value() ? latestTopics.find(topicAndSchemaName) != latestTopics.end()
@@ -558,7 +558,7 @@ void FoxgloveBridge::updateAdvertisedTopics(
                                                   return topicAndDatatype.first == topic;
                                                 });
       if (!topicStillExists) {
-        const auto channelId = channel.id();
+        const auto channelId = channel->id();
         RCLCPP_INFO(this->get_logger(), "Removing channel %" PRIu64 " for topic \"%s\" (%s)",
                     static_cast<uint64_t>(channelId), topic.c_str(), schemaName.c_str());
         // Remove any active subscriptions for this channel
@@ -577,10 +577,10 @@ void FoxgloveBridge::updateAdvertisedTopics(
 
       if (std::find_if(_channels.begin(), _channels.end(), [&topic, &schemaName](const auto& kvp) {
             const auto& [channelId, channel] = kvp;
-            const auto channelSchema = channel.schema();
+            const auto channelSchema = channel->schema();
             // A channel without a schema (definition lookup failed) matches by topic alone so
             // that the topic is not re-advertised on every graph change.
-            return channel.topic() == topic &&
+            return channel->topic() == topic &&
                    (!channelSchema.has_value() || channelSchema->name == schemaName);
           }) != _channels.end()) {
         continue;
@@ -635,7 +635,8 @@ void FoxgloveBridge::updateAdvertisedTopics(
       const ChannelId channelId = channelResult.value().id();
       RCLCPP_INFO(this->get_logger(), "Advertising new channel %" PRIu64 " for topic \"%s\"",
                   static_cast<uint64_t>(channelId), topic.c_str());
-      _channels.insert({channelId, std::move(channelResult.value())});
+      _channels.insert({channelId, std::make_shared<foxglove::RawChannel>(
+                                     std::move(channelResult.value()))});
     }
   }
 
@@ -647,7 +648,7 @@ void FoxgloveBridge::updateAdvertisedTopics(
   // from _channels mean both createOrIncrementSubscriptionLocked and
   // rosMessageHandler gracefully ignore channels they can't find.
   for (auto& channel : channelsToClose) {
-    channel.close();
+    channel->close();
   }
 }
 
@@ -964,9 +965,9 @@ void FoxgloveBridge::createOrIncrementSubscriptionLocked(ChannelId channelId, Cl
 
   if (isNewSubscription) {
     // First subscriber for this channel -- create the ROS subscription
-    const std::string topic(channel.topic());
+    const std::string topic(channel->topic());
     std::string datatype;
-    if (const auto channelSchema = channel.schema(); channelSchema.has_value()) {
+    if (const auto channelSchema = channel->schema(); channelSchema.has_value()) {
       datatype = channelSchema->name;
     } else {
       // The channel was advertised without a schema (definition lookup failed). Resolve the
@@ -1008,7 +1009,7 @@ void FoxgloveBridge::createOrIncrementSubscriptionLocked(ChannelId channelId, Cl
   if (!isNewSubscription && sinkId.has_value()) {
     for (const auto& [gid, cache] : subIt->second.publisherCaches) {
       for (const auto& cached : cache.messages) {
-        channel.log(reinterpret_cast<const std::byte*>(cached.data.data()), cached.data.size(),
+        channel->log(reinterpret_cast<const std::byte*>(cached.data.data()), cached.data.size(),
                     cached.timestamp, sinkId.value());
       }
     }
@@ -1418,35 +1419,49 @@ void FoxgloveBridge::rosMessageHandler(ChannelId channelId,
   assert(timestamp >= 0 && "Timestamp is negative");
   const auto rclSerializedMsg = msg->get_rcl_serialized_message();
 
-  std::lock_guard<std::mutex> lock(_subscriptionsMutex);
-  auto channelIt = _channels.find(channelId);
-  if (channelIt == _channels.end()) {
-    return;
-  }
-
-  // Cache messages per-publisher for transient_local subscriptions so late subscribers receive
-  // them.
-  auto subIt = _subscriptions.find(channelId);
-  if (subIt != _subscriptions.end() &&
-      subIt->second.qos.durability() == rclcpp::DurabilityPolicy::TransientLocal) {
-    Gid gid;
-    const auto& rawGid = messageInfo.get_rmw_message_info().publisher_gid;
-    std::copy(rawGid.data, rawGid.data + RMW_GID_STORAGE_SIZE, gid.begin());
-
-    auto& pubCache = subIt->second.publisherCaches[gid];
-    if (pubCache.messages.size() >= pubCache.maxMessages) {
-      pubCache.messages.pop_front();
+  std::shared_ptr<foxglove::RawChannel> channel;
+  {
+    std::lock_guard<std::mutex> lock(_subscriptionsMutex);
+    auto channelIt = _channels.find(channelId);
+    if (channelIt == _channels.end()) {
+      return;
     }
-    pubCache.messages.push_back(CachedMessage{
-      {rclSerializedMsg.buffer, rclSerializedMsg.buffer + rclSerializedMsg.buffer_length},
-      static_cast<uint64_t>(timestamp),
-    });
+    // Copy the (refcounted) channel handle so we can call log() -- a synchronous,
+    // per-client-connection memcpy of the full payload -- after releasing
+    // _subscriptionsMutex. Holding the lock across log() serializes every topic's
+    // callback on this bridge-global mutex behind whichever topic is currently
+    // fanning out to clients (e.g. a multi-MB point cloud), stalling small,
+    // latency-sensitive topics like camera frames. RawChannel::log() is documented
+    // thread-safe/noexcept, so it's safe to call without the lock; the shared_ptr
+    // keeps the underlying handle alive even if updateAdvertisedTopics() erases this
+    // channel from _channels concurrently on the rosgraph poll thread.
+    channel = channelIt->second;
+
+    // Cache messages per-publisher for transient_local subscriptions so late subscribers receive
+    // them.
+    auto subIt = _subscriptions.find(channelId);
+    if (subIt != _subscriptions.end() &&
+        subIt->second.qos.durability() == rclcpp::DurabilityPolicy::TransientLocal) {
+      Gid gid;
+      const auto& rawGid = messageInfo.get_rmw_message_info().publisher_gid;
+      std::copy(rawGid.data, rawGid.data + RMW_GID_STORAGE_SIZE, gid.begin());
+
+      auto& pubCache = subIt->second.publisherCaches[gid];
+      if (pubCache.messages.size() >= pubCache.maxMessages) {
+        pubCache.messages.pop_front();
+      }
+      pubCache.messages.push_back(CachedMessage{
+        {rclSerializedMsg.buffer, rclSerializedMsg.buffer + rclSerializedMsg.buffer_length},
+        static_cast<uint64_t>(timestamp),
+      });
+    }
   }
 
   // Log without sink_id to broadcast to all sinks (WebSocket server + Gateway).
   // Each sink internally handles routing to its subscribed clients.
-  channelIt->second.log(reinterpret_cast<const std::byte*>(rclSerializedMsg.buffer),
-                        rclSerializedMsg.buffer_length, timestamp);
+  // Intentionally called outside _subscriptionsMutex; see comment above.
+  channel->log(reinterpret_cast<const std::byte*>(rclSerializedMsg.buffer),
+              rclSerializedMsg.buffer_length, timestamp);
 }
 
 void FoxgloveBridge::handleServiceRequest(const foxglove::ServiceRequest& request,
