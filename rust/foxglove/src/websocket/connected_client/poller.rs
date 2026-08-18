@@ -7,7 +7,7 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::websocket::Status;
 use crate::websocket::streams::ServerStream;
 
-use super::{ConnectedClient, ShutdownReason};
+use super::{ConnectedClient, DataPlaneItem, ShutdownReason};
 
 /// A poller for a connected client.
 ///
@@ -17,7 +17,7 @@ use super::{ConnectedClient, ShutdownReason};
 /// - Waiting for a shutdown signal, and closing the WebSocket.
 pub(super) struct Poller {
     websocket: WebSocketStream<ServerStream<TcpStream>>,
-    data_plane_rx: flume::Receiver<Message>,
+    data_plane_rx: flume::Receiver<DataPlaneItem>,
     control_plane_rx: flume::Receiver<Message>,
     shutdown_rx: oneshot::Receiver<ShutdownReason>,
 }
@@ -26,7 +26,7 @@ impl Poller {
     /// Creates a new poller.
     pub fn new(
         websocket: WebSocketStream<ServerStream<TcpStream>>,
-        data_plane_rx: flume::Receiver<Message>,
+        data_plane_rx: flume::Receiver<DataPlaneItem>,
         control_plane_rx: flume::Receiver<Message>,
         shutdown_rx: oneshot::Receiver<ShutdownReason>,
     ) -> Self {
@@ -58,9 +58,13 @@ impl Poller {
 
         // Send messages from queues to the WebSocket.
         let ws_tx_loop = async {
+            // Frame assembly for data-plane log data (per-client header + shared payload) happens
+            // here, in `DataPlaneItem::into_message`, on this client's own poller task --
+            // immediately before the socket write, and never on the thread that called into the
+            // SDK to log the message.
             while let Ok(msg) = tokio::select! {
                 msg = self.control_plane_rx.recv_async() => msg,
-                msg = self.data_plane_rx.recv_async() => msg,
+                item = self.data_plane_rx.recv_async() => item.map(DataPlaneItem::into_message),
             } {
                 if let Err(err) = ws_tx.send(msg).await {
                     tracing::error!("Error sending message to client {addr}: {err}");

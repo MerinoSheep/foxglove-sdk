@@ -32,9 +32,11 @@ use super::{
 };
 use crate::remote_common::semaphore::Semaphore;
 
+mod data_plane_item;
 mod poller;
 mod send_lossy;
 
+use data_plane_item::DataPlaneItem;
 use poller::Poller;
 
 const MAX_SEND_RETRIES: usize = 10;
@@ -65,8 +67,8 @@ pub(super) struct ConnectedClient {
     poller: parking_lot::Mutex<Option<Poller>>,
     /// A cache of channels for `on_subscribe` and `on_unsubscribe` callbacks.
     channels: parking_lot::RwLock<HashMap<ChannelId, Arc<RawChannel>>>,
-    data_plane_tx: flume::Sender<Message>,
-    data_plane_rx: flume::Receiver<Message>,
+    data_plane_tx: flume::Sender<DataPlaneItem>,
+    data_plane_rx: flume::Receiver<DataPlaneItem>,
     control_plane_tx: flume::Sender<Message>,
     service_call_sem: Semaphore,
     fetch_asset_sem: Semaphore,
@@ -105,9 +107,37 @@ impl Sink for ConnectedClient {
         let Some(subscription_id) = subscriptions.get_by_left(&channel.id()).copied() else {
             return Ok(());
         };
+        drop(subscriptions);
 
         let message = MessageData::new(subscription_id.into(), metadata.log_time, msg);
-        self.send_data_lossy(&message, MAX_SEND_RETRIES);
+        self.send_data_lossy(Message::from(&message), MAX_SEND_RETRIES);
+        Ok(())
+    }
+
+    fn log_shared(
+        &self,
+        channel: &RawChannel,
+        msg: &crate::sink::SharedLogPayload<'_>,
+        metadata: &Metadata,
+    ) -> Result<(), FoxgloveError> {
+        let subscriptions = self.subscriptions.lock();
+        let Some(subscription_id) = subscriptions.get_by_left(&channel.id()).copied() else {
+            return Ok(());
+        };
+        drop(subscriptions);
+
+        // `shared_bytes` copies the payload out of the caller's buffer at most once per
+        // `log_to_sinks` call, no matter how many `ConnectedClient`s (i.e. connected WebSocket
+        // clients) are subscribed to this channel; every call after the first, including this
+        // one for any client beyond the first, is just a cheap `Bytes` refcount clone. The final
+        // per-client frame (header + payload) is assembled later, in this client's own poller
+        // task, immediately before the socket write -- not here, on the caller's thread.
+        let item = DataPlaneItem::LogData {
+            subscription_id: subscription_id.into(),
+            log_time: metadata.log_time,
+            payload: msg.shared_bytes(),
+        };
+        self.send_data_lossy(item, MAX_SEND_RETRIES);
         Ok(())
     }
 
@@ -287,13 +317,13 @@ impl ConnectedClient {
         }
     }
 
-    /// Send the message on the data plane, dropping up to retries older messages to make room, if necessary.
-    fn send_data_lossy(&self, message: impl Into<Message>, retries: usize) -> SendLossyResult {
+    /// Send the item on the data plane, dropping up to retries older items to make room, if necessary.
+    fn send_data_lossy(&self, item: impl Into<DataPlaneItem>, retries: usize) -> SendLossyResult {
         send_lossy::send_lossy(
             &self.addr,
             &self.data_plane_tx,
             &self.data_plane_rx,
-            message.into(),
+            item.into(),
             retries,
         )
     }
@@ -792,7 +822,7 @@ impl ConnectedClient {
     pub fn send_status(&self, status: Status) {
         match status.level {
             StatusLevel::Info => {
-                self.send_data_lossy(&status, MAX_SEND_RETRIES);
+                self.send_data_lossy(Message::from(&status), MAX_SEND_RETRIES);
             }
             _ => {
                 self.send_control_msg(&status);

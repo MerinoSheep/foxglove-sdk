@@ -11,7 +11,7 @@ use tracing::warn;
 
 use super::{ChannelDescriptor, ChannelId};
 use crate::log_sink_set::LogSinkSet;
-use crate::sink::SmallSinkVec;
+use crate::sink::{SharedLogPayload, SmallSinkVec};
 use crate::throttler::Throttler;
 use crate::{Context, Metadata, PartialMetadata, Schema, SinkId, nanoseconds_since_epoch};
 
@@ -205,15 +205,23 @@ impl RawChannel {
             log_time: opts.log_time.unwrap_or_else(nanoseconds_since_epoch),
         };
 
+        // Shared across every sink invoked below: any sink that needs an owned copy of `msg`
+        // (e.g. a WebSocket client handing it off to its async send task) can obtain one lazily
+        // via `SharedLogPayload::shared_bytes`. The underlying payload is copied at most once no
+        // matter how many such sinks are subscribed to this channel (e.g. multiple simultaneous
+        // WebSocket viewers), instead of once per sink.
+        let payload = SharedLogPayload::new(msg);
+
         match sink_id {
             Some(id) => {
                 self.sinks.for_each_filtered(
                     |sink| sink.id() == id,
-                    |sink| sink.log(self, msg, &metadata),
+                    |sink| sink.log_shared(self, &payload, &metadata),
                 );
             }
             None => {
-                self.sinks.for_each(|sink| sink.log(self, msg, &metadata));
+                self.sinks
+                    .for_each(|sink| sink.log_shared(self, &payload, &metadata));
             }
         }
     }

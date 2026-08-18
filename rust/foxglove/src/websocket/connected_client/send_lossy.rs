@@ -3,7 +3,6 @@ use std::time::Duration;
 
 use flume::TrySendError;
 use parking_lot::Mutex;
-use tokio_tungstenite::tungstenite::Message;
 
 use crate::throttler::Throttler;
 
@@ -24,11 +23,11 @@ pub(crate) enum SendLossyResult {
 /// If the channel is full, drop the oldest message and try again. If the send eventually succeeds
 /// in this manner, this function returns `SendLossyResult::SentLossy(dropped)`. If the maximum
 /// number of retries is reached, it returns `SendLossyResult::ExhaustedRetries`.
-pub(crate) fn send_lossy(
+pub(crate) fn send_lossy<T>(
     client_addr: &SocketAddr,
-    tx: &flume::Sender<Message>,
-    rx: &flume::Receiver<Message>,
-    mut message: Message,
+    tx: &flume::Sender<T>,
+    rx: &flume::Receiver<T>,
+    mut message: T,
     retries: usize,
 ) -> SendLossyResult {
     // If the queue is full, drop the oldest message(s). We do this because the WebSocket
@@ -64,6 +63,7 @@ pub(crate) fn send_lossy(
 #[cfg(test)]
 mod tests {
     use assert_matches::assert_matches;
+    use tokio_tungstenite::tungstenite::Message;
     use tracing_test::traced_test;
 
     use super::*;

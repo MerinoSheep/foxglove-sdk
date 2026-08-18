@@ -564,6 +564,74 @@ async fn test_log_only_to_subscribers() {
     let _ = server.stop();
 }
 
+/// Regression test for the shared-payload-copy fan-out fix: with several clients subscribed to
+/// the same channel, each client must still receive the complete, correct payload, tagged with
+/// its own (distinct) subscription id and the shared log time -- even though the payload is now
+/// only copied out of the caller-provided buffer once and shared (via a refcounted `Bytes`)
+/// across all of the clients' send queues, rather than copied once per client up front.
+#[traced_test]
+#[tokio::test]
+async fn test_log_fanout_to_many_clients_shares_payload() {
+    const NUM_CLIENTS: usize = 8;
+    // Large enough to make an accidental N-way copy or any cross-client payload mixup obvious.
+    const PAYLOAD_LEN: usize = 512 * 1024;
+
+    let ctx = Context::new();
+    let server = create_server(&ctx, ServerOptions::default());
+    let ch = new_channel("/fanout", &ctx);
+
+    let addr = server
+        .start("127.0.0.1", 0)
+        .await
+        .expect("Failed to start server");
+
+    let mut clients = Vec::with_capacity(NUM_CLIENTS);
+    for _ in 0..NUM_CLIENTS {
+        let client = WebSocketClient::connect(format!("{addr}"))
+            .await
+            .expect("Failed to connect");
+        clients.push(client);
+    }
+
+    for client in &mut clients {
+        expect_recv!(client, ServerMessage::ServerInfo);
+        expect_recv!(client, ServerMessage::Advertise);
+    }
+
+    // Give each client a distinct subscription id for the same channel.
+    for (i, client) in clients.iter_mut().enumerate() {
+        let subscription_id = 1000 + i as u32;
+        client
+            .send(&Subscribe::new([Subscription::new(
+                subscription_id,
+                ch.id().into(),
+            )]))
+            .await
+            .expect("Failed to send");
+    }
+
+    assert_eventually(|| ch.num_sinks() == NUM_CLIENTS).await;
+
+    // A large, distinctively-patterned payload so any truncation, corruption, or cross-client
+    // aliasing would be caught.
+    let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i % 251) as u8).collect();
+    let metadata = PartialMetadata {
+        log_time: Some(987654321),
+    };
+    ch.log_with_meta(&payload, metadata);
+
+    for (i, client) in clients.iter_mut().enumerate() {
+        let expected_subscription_id = 1000 + i as u32;
+        let msg = expect_recv!(client, ServerMessage::MessageData);
+        assert_eq!(msg.subscription_id, expected_subscription_id);
+        assert_eq!(msg.log_time, 987654321);
+        assert_eq!(msg.data.len(), PAYLOAD_LEN);
+        assert_eq!(msg.data, Cow::<[u8]>::Owned(payload.clone()));
+    }
+
+    let _ = server.stop();
+}
+
 #[traced_test]
 #[tokio::test]
 async fn test_server_transmits_empty_message() {
