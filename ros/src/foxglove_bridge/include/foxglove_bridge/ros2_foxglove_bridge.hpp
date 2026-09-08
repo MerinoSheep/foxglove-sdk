@@ -95,7 +95,7 @@ private:
 
   std::unique_ptr<foxglove::WebSocketServer> _server;
   std::unique_ptr<foxglove::SystemInfoPublisher> _sysinfoPublisher;
-  std::unordered_map<ChannelId, foxglove::RawChannel> _channels;
+  std::unordered_map<ChannelId, std::shared_ptr<foxglove::RawChannel>> _channels;
 
   // One shared ROS subscription per channel, reference-counted by client subscriptions
   struct CachedMessage {
