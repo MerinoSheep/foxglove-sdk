@@ -571,6 +571,15 @@ void FoxgloveBridge::updateAdvertisedTopics(
                     static_cast<uint64_t>(channelId), topic.c_str(), schemaName.c_str());
         // Remove any active subscriptions for this channel
         _subscriptions.erase(channelId);
+        // Keep the lookup index in sync with _channels.
+        if (channelSchema.has_value()) {
+          _channelIdByTopicAndSchema.erase(topicAndSchemaName);
+        } else {
+          auto countIt = _schemalessChannelCountByTopic.find(topic);
+          if (countIt != _schemalessChannelCountByTopic.end() && --countIt->second <= 0) {
+            _schemalessChannelCountByTopic.erase(countIt);
+          }
+        }
         channelsToClose.push_back(std::move(channel));
         channelIt = _channels.erase(channelIt);
       } else {
@@ -583,14 +592,13 @@ void FoxgloveBridge::updateAdvertisedTopics(
       const auto& topic = topicAndDatatype.first;
       const auto& schemaName = topicAndDatatype.second;
 
-      if (std::find_if(_channels.begin(), _channels.end(), [&topic, &schemaName](const auto& kvp) {
-            const auto& [channelId, channel] = kvp;
-            const auto channelSchema = channel.schema();
-            // A channel without a schema (definition lookup failed) matches by topic alone so
-            // that the topic is not re-advertised on every graph change.
-            return channel.topic() == topic &&
-                   (!channelSchema.has_value() || channelSchema->name == schemaName);
-          }) != _channels.end()) {
+      // O(1) equivalent of a linear _channels scan: a channel already exists for this topic if
+      // either the exact (topic, schemaName) pair is indexed, or a schemaless channel (matches
+      // by topic alone -- see the removal loop's comment above) is indexed for this topic.
+      const bool channelAlreadyExists =
+        _channelIdByTopicAndSchema.find(topicAndDatatype) != _channelIdByTopicAndSchema.end() ||
+        _schemalessChannelCountByTopic.find(topic) != _schemalessChannelCountByTopic.end();
+      if (channelAlreadyExists) {
         continue;
       }
 
@@ -643,6 +651,13 @@ void FoxgloveBridge::updateAdvertisedTopics(
       const ChannelId channelId = channelResult.value().id();
       RCLCPP_INFO(this->get_logger(), "Advertising new channel %" PRIu64 " for topic \"%s\"",
                   static_cast<uint64_t>(channelId), topic.c_str());
+      // Keep the lookup index in sync with _channels; mirrors the schema-presence check the
+      // removal loop performs via channel.schema() post-creation.
+      if (schema.has_value()) {
+        _channelIdByTopicAndSchema[{topic, schemaName}] = channelId;
+      } else {
+        ++_schemalessChannelCountByTopic[topic];
+      }
       _channels.insert({channelId, std::move(channelResult.value())});
     }
   }

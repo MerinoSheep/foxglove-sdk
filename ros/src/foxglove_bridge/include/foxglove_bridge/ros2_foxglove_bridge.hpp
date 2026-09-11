@@ -97,6 +97,16 @@ private:
   std::unique_ptr<foxglove::SystemInfoPublisher> _sysinfoPublisher;
   std::unordered_map<ChannelId, foxglove::RawChannel> _channels;
 
+  // O(1) index answering "does a channel already exist that satisfies (topic, schemaName)",
+  // maintained alongside _channels so updateAdvertisedTopics's advertise loop doesn't need to
+  // linear-scan _channels once per topic in latestTopics. Schema-bearing channels are keyed by
+  // the exact (topic, schemaName) pair. Channels advertised without a schema (definition lookup
+  // failed) match any schemaName for their topic -- mirroring the existing "match by topic
+  // alone" semantics -- so they're tracked separately, by topic, with a count (rather than a
+  // set) in case more than one schemaless channel exists for the same topic.
+  std::unordered_map<TopicAndDatatype, ChannelId, PairHash> _channelIdByTopicAndSchema;
+  std::unordered_map<std::string, int> _schemalessChannelCountByTopic;
+
   // One shared ROS subscription per channel, reference-counted by client subscriptions
   struct CachedMessage {
     std::vector<uint8_t> data;
