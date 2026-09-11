@@ -194,12 +194,6 @@ FoxgloveBridge::FoxgloveBridge(const rclcpp::NodeOptions& options)
   sdkServerOptions.host = address;
   sdkServerOptions.port = port;
   sdkServerOptions.supported_encodings = {"cdr", "json"};
-  sdkServerOptions.capabilities = _capabilities;
-  sdkServerOptions.context = _serverContext;
-
-  sdkServerOptions.server_info = rosServerInfo;
-  sdkServerOptions.message_backlog_size = messageBacklogSize;
-
   // Always advertise Time, not just under sim time. Without it Foxglove falls back to the
   // *client's* wall clock for currentTime (Studio v1.36.0: "Use system time for Foxglove
   // WebSocket connections if the server does not publish time messages"). Anything resolved at
@@ -207,8 +201,11 @@ FoxgloveBridge::FoxgloveBridge(const rclcpp::NodeOptions& options)
   // transform looked up at the viewer's clock rather than the robot's, while message-stamped
   // geometry still renders correctly, producing a scene inconsistent by exactly the client/server
   // clock skew.
-  sdkServerOptions.capabilities =
-    sdkServerOptions.capabilities | foxglove::WebSocketServerCapabilities::Time;
+  sdkServerOptions.capabilities = _capabilities | foxglove::WebSocketServerCapabilities::Time;
+  sdkServerOptions.context = _serverContext;
+
+  sdkServerOptions.server_info = rosServerInfo;
+  sdkServerOptions.message_backlog_size = messageBacklogSize;
 
   // If TLS is enabled, load the certificate and key files from disk
   if (useTls) {
@@ -311,10 +308,8 @@ FoxgloveBridge::FoxgloveBridge(const rclcpp::NodeOptions& options)
   if (_useSimTime) {
     _clockSubscription = this->create_subscription<rosgraph_msgs::msg::Clock>(
       "/clock", rclcpp::QoS{rclcpp::KeepLast(1)}.best_effort(),
-      [&](std::shared_ptr<const rosgraph_msgs::msg::Clock> msg) {
-        const auto timestamp = rclcpp::Time{msg->clock}.nanoseconds();
-        assert(timestamp >= 0 && "Timestamp is negative");
-        _server->broadcastTime(static_cast<uint64_t>(timestamp));
+      [this](std::shared_ptr<const rosgraph_msgs::msg::Clock> msg) {
+        broadcastTime(rclcpp::Time{msg->clock}.nanoseconds());
       });
   } else {
     // Outside sim there is no /clock, so drive the broadcast from this node's own clock -- the
@@ -325,7 +320,11 @@ FoxgloveBridge::FoxgloveBridge(const rclcpp::NodeOptions& options)
     // must not depend on delivery through the message bus it is itself serving. A stalled topic
     // would freeze the viewer's clock; a stalled hardware clock is not a failure mode.
     _timeBroadcastTimer = this->create_wall_timer(std::chrono::milliseconds(100), [this]() {
-      _server->broadcastTime(static_cast<uint64_t>(this->now().nanoseconds()));
+      // Skip the broadcast (and its internal per-client work) when nobody is listening.
+      if (_server->clientCount() == 0) {
+        return;
+      }
+      broadcastTime(this->now().nanoseconds());
     });
   }
 
@@ -465,6 +464,11 @@ FoxgloveBridge::FoxgloveBridge(const rclcpp::NodeOptions& options)
 
   _rosgraphPollThread =
     std::make_unique<std::thread>(std::bind(&FoxgloveBridge::rosgraphPollThread, this));
+}
+
+void FoxgloveBridge::broadcastTime(int64_t nanoseconds) {
+  assert(nanoseconds >= 0 && "Timestamp is negative");
+  _server->broadcastTime(static_cast<uint64_t>(nanoseconds));
 }
 
 FoxgloveBridge::~FoxgloveBridge() {
